@@ -740,6 +740,16 @@ def grade_exposure(conn: sqlite3.Connection, payload: dict[str, Any]) -> dict[st
             raise
 
 
+def _is_interval_unique_conflict(message: str) -> bool:
+    normalized = message.lower().replace(" ", "")
+    return (
+        "uniqueconstraintfailed" in normalized
+        and "exposures.plate_id" in normalized
+        and "exposures.installed_at" in normalized
+        and "exposures.removed_at" in normalized
+    )
+
+
 def _grade_exposure_tx(
     conn: sqlite3.Connection, payload: dict[str, Any]
 ) -> dict[str, Any]:
@@ -798,13 +808,26 @@ def _grade_exposure_tx(
                 ),
             )
         except sqlite3.IntegrityError as exc:
-            if "UNIQUE" in str(exc).upper():
-                exposure = conn.execute(
-                    "SELECT * FROM exposures WHERE upload_hash=?", (upload_hash,)
-                ).fetchone()
+            message = str(exc)
+            duplicate_exposure = conn.execute(
+                "SELECT * FROM exposures WHERE upload_hash=?", (upload_hash,)
+            ).fetchone()
+            if duplicate_exposure is not None:
+                exposure = duplicate_exposure
                 duplicate = True
-            else:
-                raise
+            elif _is_interval_unique_conflict(message):
+                raise ApiError(
+                    409,
+                    "EXPOSURE_INTERVAL_CONFLICT",
+                    "same plate interval already exists for this immutable segment version",
+                    {
+                        "version_hash": version["version_hash"],
+                        "plate_code": plate["plate_code"],
+                        "installed_at": iso(installed),
+                        "removed_at": iso(removed),
+                    },
+                )
+            raise
         else:
             inserted_new = True
             exposure = conn.execute(
@@ -840,24 +863,31 @@ def _grade_exposure_tx(
 
     # Re-marking is idempotent. It covers both a new physical reuse and a
     # duplicate request arriving after another overlapping exposure.
-    _mark_overlaps(conn, exposure, actor or "system")
+    target_overlap_added = _mark_overlaps(conn, exposure, actor or "system")
+    current_flag_added = target_overlap_added
 
     tolerance = config["photo_tolerance_seconds"]
     if abs((photo - removed).total_seconds()) > tolerance:
-        _ensure_flag(
-            conn, exposure["id"], "PHOTO_MISALIGNED", None,
-            f"photo time differs from removal by more than {tolerance:g}s",
-            actor or "system", audit_it=True,
+        current_flag_added = (
+            _ensure_flag(
+                conn, exposure["id"], "PHOTO_MISALIGNED", None,
+                f"photo time differs from removal by more than {tolerance:g}s",
+                actor or "system", audit_it=True,
+            )
+            or current_flag_added
         )
 
     for cell_index in sorted(contaminated):
-        _ensure_flag(
-            conn, exposure["id"], "LOCAL_CONTAMINATION", cell_index,
-            "local contamination marked during upload",
-            actor or "system", audit_it=True,
+        current_flag_added = (
+            _ensure_flag(
+                conn, exposure["id"], "LOCAL_CONTAMINATION", cell_index,
+                "local contamination marked during upload",
+                actor or "system", audit_it=True,
+            )
+            or current_flag_added
         )
 
-    if duplicate:
+    if duplicate and not current_flag_added:
         latest = conn.execute(
             "SELECT * FROM evaluation_events WHERE exposure_id=? ORDER BY id DESC LIMIT 1",
             (exposure["id"],),
@@ -927,7 +957,7 @@ def _validate_cell_counts(
 
 def _mark_overlaps(
     conn: sqlite3.Connection, exposure: sqlite3.Row, actor: str
-) -> None:
+) -> bool:
     others = conn.execute(
         """
         SELECT * FROM exposures
@@ -939,6 +969,7 @@ def _mark_overlaps(
             exposure["removed_at"], exposure["installed_at"],
         ),
     ).fetchall()
+    target_flag_added = False
     affected: list[int] = []
     for other in others:
         for exposure_id in (exposure["id"], other["id"]):
@@ -947,10 +978,13 @@ def _mark_overlaps(
                 "same physical target was used during an overlapping interval",
                 actor, audit_it=True,
             )
-            if inserted and exposure_id != exposure["id"]:
+            if exposure_id == exposure["id"]:
+                target_flag_added = target_flag_added or inserted
+            elif inserted:
                 affected.append(exposure_id)
     for exposure_id in affected:
         evaluate_exposure(conn, exposure_id, actor="system")
+    return target_flag_added
 
 
 def _ensure_flag(
@@ -1194,6 +1228,9 @@ def evaluate_exposure(
         "SELECT consecutive_passes FROM segment_streaks WHERE segment_version_id=?",
         (version["id"],),
     ).fetchone()["consecutive_passes"]
+    evaluation_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM evaluation_events"
+    ).fetchone()["next_id"]
     streak_after = _recompute_streak(
         conn,
         version["id"],
@@ -1206,6 +1243,7 @@ def evaluate_exposure(
     decision = {
         "result": result,
         "grade": result,
+        "evaluation_event_id": evaluation_id,
         "duplicate_upload": duplicate,
         "upload_hash": upload_hash or exposure["upload_hash"],
         "exposure_id": exposure["id"],
@@ -1274,15 +1312,17 @@ def evaluate_exposure(
         ),
     }
 
-    cur = conn.execute(
+    conn.execute(
         """
         INSERT INTO evaluation_events(
-            exposure_id, result, grade, decision_json, evaluated_at
-        ) VALUES (?, ?, ?, ?, ?)
+            id, exposure_id, result, grade, decision_json, evaluated_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
         """,
-        (exposure["id"], result, result, json.dumps(decision, ensure_ascii=False), now_iso()),
+        (
+            evaluation_id, exposure["id"], result, result,
+            json.dumps(decision, ensure_ascii=False), now_iso(),
+        ),
     )
-    evaluation_id = cur.lastrowid
     audit_row = audit(
         conn,
         "EXPOSURE_GRADED",
@@ -1299,7 +1339,6 @@ def evaluate_exposure(
             "minimum_failing_grid": min_failing_grid,
         },
     )
-    decision["evaluation_event_id"] = evaluation_id
     decision["audit"] = audit_row
     return decision
 

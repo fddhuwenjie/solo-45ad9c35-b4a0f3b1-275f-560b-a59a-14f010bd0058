@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS exposures (
     upload_hash TEXT NOT NULL UNIQUE,
     created_at TEXT NOT NULL,
     CHECK(removed_at >= installed_at),
-    UNIQUE(plate_id, installed_at, removed_at)
+    UNIQUE(segment_version_id, plate_id, installed_at, removed_at)
 );
 
 CREATE TABLE IF NOT EXISTS exposure_cell_counts (
@@ -157,8 +157,82 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_legacy_schema(conn: sqlite3.Connection) -> bool:
+    """Rebuild the exposures table when using the old global interval key.
+
+    The old UNIQUE(plate_id, installed_at, removed_at) constraint treated the
+    same physical plate interval as globally unique even when it was reported
+    for a different immutable segment version.  Cross-version evidence must be
+    retained as two exposure rows and linked through OVERLAP flags instead.
+    """
+    indexes = conn.execute("PRAGMA index_list('exposures')").fetchall()
+    for index in indexes:
+        name = index["name"]
+        if not name.startswith("sqlite_autoindex_exposures_"):
+            continue
+        columns = [
+            row["name"]
+            for row in conn.execute(f"PRAGMA index_info('{name}')").fetchall()
+        ]
+        if columns == ["plate_id", "installed_at", "removed_at"]:
+            break
+    else:
+        return False
+
+    # Rebuilding an append-only table uses a controlled schema migration, not
+    # application-level delete/update. Foreign keys stay disabled until the
+    # replacement table exists with the same row identifiers.
+    had_foreign_keys = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    conn.commit()
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        for action in ("UPDATE", "DELETE"):
+            conn.execute(f"DROP TRIGGER IF EXISTS trg_exposures_no_{action.lower()}")
+        conn.execute("ALTER TABLE exposures RENAME TO exposures_legacy")
+        conn.execute(
+            """
+            CREATE TABLE exposures (
+                id INTEGER PRIMARY KEY,
+                segment_version_id INTEGER NOT NULL REFERENCES segment_versions(id),
+                plate_id INTEGER NOT NULL REFERENCES plates(id),
+                mount_position TEXT,
+                installed_at TEXT NOT NULL,
+                removed_at TEXT NOT NULL,
+                photo_at TEXT NOT NULL,
+                unexposed_json TEXT NOT NULL DEFAULT '[]',
+                upload_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                CHECK(removed_at >= installed_at),
+                UNIQUE(segment_version_id, plate_id, installed_at, removed_at)
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO exposures (
+                id, segment_version_id, plate_id, mount_position,
+                installed_at, removed_at, photo_at, unexposed_json,
+                upload_hash, created_at
+            )
+            SELECT
+                id, segment_version_id, plate_id, mount_position,
+                installed_at, removed_at, photo_at, unexposed_json,
+                upload_hash, created_at
+            FROM exposures_legacy
+            """
+        )
+        conn.execute("DROP TABLE exposures_legacy")
+        conn.commit()
+    finally:
+        if had_foreign_keys:
+            conn.execute("PRAGMA foreign_keys=ON")
+    return True
+
+
 def initialize(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
+    _migrate_legacy_schema(conn)
     conn.executescript(SCHEMA_SQL)
     for table in APPEND_ONLY_TABLES:
         conn.execute(

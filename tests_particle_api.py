@@ -318,6 +318,167 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual(decision["consecutive_passes"], 1)
         self.assertTrue(db.verify_audit_chain(self.conn)["ok"])
 
+    def test_duplicate_upload_with_new_contamination_regrades_and_resets_streak(self):
+        start = self.base + timedelta(hours=6)
+        end = start + timedelta(minutes=1)
+        self._pressure(start, end)
+        payload = {
+            "version_hash": self.segment["version_hash"],
+            "plate_code": "T-01",
+            "mount_position": "A",
+            "installed_at": iso(start),
+            "removed_at": iso(end),
+            "photo_at": iso(end),
+            "unexposed_cells": [],
+            "contaminated_cells": [],
+            "cell_counts": [{"cell_index": 0, "by_bin": [0, 0]}],
+            "actor": "tester",
+        }
+        first = grade_exposure(self.conn, payload)
+        self.assertEqual(first["result"], "PASS")
+        self.assertEqual(first["consecutive_passes"], 1)
+        self.assertFalse(first["duplicate_upload"])
+
+        # The measurable evidence is the same, so upload_hash stays stable, but
+        # the corrected metadata adds a hard contamination flag. The endpoint
+        # must append a new grading event instead of returning the old PASS.
+        corrected = dict(payload, contaminated_cells=[2])
+        second = grade_exposure(self.conn, corrected)
+        self.assertTrue(second["duplicate_upload"])
+        self.assertEqual(second["exposure_id"], first["exposure_id"])
+        self.assertEqual(second["result"], "INVALID")
+        self.assertIn("HARD_FLAG:LOCAL_CONTAMINATION", second["invalid_reasons"])
+        self.assertEqual(second["consecutive_passes"], 0)
+        self.assertEqual(
+            second["streak_bound_to_version_hash"], self.segment["version_hash"]
+        )
+
+        exposure_count = self.conn.execute(
+            "SELECT COUNT(*) c FROM exposures WHERE id=?", (first["exposure_id"],)
+        ).fetchone()["c"]
+        self.assertEqual(exposure_count, 1)
+        grading_count = self.conn.execute(
+            "SELECT COUNT(*) c FROM evaluation_events WHERE exposure_id=?",
+            (first["exposure_id"],),
+        ).fetchone()["c"]
+        self.assertEqual(grading_count, 2)
+        audit_status = db.verify_audit_chain(self.conn)
+        self.assertTrue(audit_status["ok"])
+
+        # Replaying the corrected request remains idempotent: no additional
+        # exposure, flag, or grading event is appended.
+        third = grade_exposure(self.conn, corrected)
+        self.assertTrue(third["duplicate_upload"])
+        self.assertEqual(third["evaluation_event_id"], second["evaluation_event_id"])
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM exposures WHERE id=?", (first["exposure_id"],)
+        ).fetchone()["c"], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM exposure_flags WHERE exposure_id=?",
+            (first["exposure_id"],),
+        ).fetchone()["c"], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) c FROM evaluation_events WHERE exposure_id=?",
+            (first["exposure_id"],),
+        ).fetchone()["c"], 2)
+
+    def test_same_interval_rebound_to_other_version_keeps_two_overlapping_exposures(self):
+        start = self.base + timedelta(hours=7)
+        end = start + timedelta(minutes=1)
+        self._pressure(start, end)
+        common_payload = {
+            "plate_code": "T-01",
+            "mount_position": "A",
+            "installed_at": iso(start),
+            "removed_at": iso(end),
+            "photo_at": iso(end),
+            "cell_counts": [{"cell_index": 0, "by_bin": [0, 0]}],
+            "actor": "tester",
+        }
+        first = grade_exposure(
+            self.conn,
+            dict(common_payload, version_hash=self.segment["version_hash"]),
+        )
+        self.assertEqual(first["result"], "PASS")
+        self.assertEqual(first["consecutive_passes"], 1)
+
+        second_version = register_segment(self.conn, {
+            "segment_no": "SP-100",
+            "config": {
+                "size_bins": [
+                    {"lo_um": 0.0, "hi_um": 100.0},
+                    {"lo_um": 100.0, "hi_um": None},
+                ],
+                "area_limits_particles_per_m2": [1000.0, 100.0],
+                "grid_limits_particles_per_m2": [None, 100.0],
+                "min_exposure_seconds": 50.0,
+                "photo_tolerance_seconds": 5.0,
+                "target_exposure_seconds": 60.0,
+                "pressure_min_samples": 3,
+                "pressure_required_coverage": 0.9,
+                "pressure_max_gap_seconds": 25.0,
+                "plate_cooldown_seconds": 0.0,
+            },
+        })
+        self.assertNotEqual(
+            second_version["version_hash"], self.segment["version_hash"]
+        )
+        add_pressure_samples(self.conn, {
+            "version_hash": second_version["version_hash"],
+            "samples": [
+                {"sampled_at": iso(start), "pressure_pa": 120.0},
+                {"sampled_at": iso(start + timedelta(seconds=20)), "pressure_pa": 120.0},
+                {"sampled_at": iso(start + timedelta(seconds=40)), "pressure_pa": 120.0},
+                {"sampled_at": iso(end), "pressure_pa": 120.0},
+            ],
+        })
+
+        second = grade_exposure(
+            self.conn,
+            dict(common_payload, version_hash=second_version["version_hash"]),
+        )
+        self.assertNotEqual(second["exposure_id"], first["exposure_id"])
+        self.assertEqual(second["result"], "INVALID")
+        self.assertIn("HARD_FLAG:OVERLAP", second["invalid_reasons"])
+        self.assertEqual(
+            second["streak_bound_to_version_hash"], second_version["version_hash"]
+        )
+        self.assertEqual(second["consecutive_passes"], 0)
+
+        exposures = self.conn.execute(
+            """
+            SELECT id, segment_version_id FROM exposures
+            WHERE plate_id=(SELECT id FROM plates WHERE plate_code='T-01')
+              AND installed_at=? AND removed_at=?
+            ORDER BY id
+            """,
+            (iso(start), iso(end)),
+        ).fetchall()
+        self.assertEqual(len(exposures), 2)
+        self.assertEqual(
+            [row["segment_version_id"] for row in exposures],
+            [self.segment["version"], second_version["version"]],
+        )
+        for exposure_id in (first["exposure_id"], second["exposure_id"]):
+            overlap_count = self.conn.execute(
+                """
+                SELECT COUNT(*) c FROM exposure_flags
+                WHERE exposure_id=? AND kind='OVERLAP'
+                """,
+                (exposure_id,),
+            ).fetchone()["c"]
+            self.assertEqual(overlap_count, 1)
+            latest = self.conn.execute(
+                """
+                SELECT result FROM evaluation_events
+                WHERE exposure_id=? ORDER BY id DESC LIMIT 1
+                """,
+                (exposure_id,),
+            ).fetchone()["result"]
+            self.assertEqual(latest, "INVALID")
+
+        self.assertTrue(db.verify_audit_chain(self.conn)["ok"])
+
     def test_immutable_version_hashes_separate_streak(self):
         first_version = self.segment["version_hash"]
         # Changed limit produces a new immutable version and independent streak.
@@ -334,6 +495,67 @@ class ServiceTest(unittest.TestCase):
         self.assertNotEqual(new["version_hash"], first_version)
         self.assertEqual(new["version"], 2)
         self.assertEqual(new["consecutive_passes"], 0)
+    def test_legacy_schema_migration_allows_same_interval_cross_version(self):
+        # Close the fresh-schema test database and build the original v1 table
+        # with a global interval unique constraint. Reinitializing must migrate
+        # it without deleting existing append-only evidence.
+        self.conn.close()
+        self.conn = db.connect(self.path)
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        for table in (
+            "audit_log", "segment_streaks", "evaluation_events",
+            "decontaminations", "clock_events", "pressure_samples",
+            "exposure_flags", "exposure_cell_counts", "exposures",
+            "plates", "segment_versions",
+        ):
+            self.conn.execute(f"DROP TABLE IF EXISTS {table}")
+        self.conn.executescript(
+            """
+            CREATE TABLE segment_versions (
+                id INTEGER PRIMARY KEY, segment_no TEXT NOT NULL,
+                version INTEGER NOT NULL, version_hash TEXT NOT NULL,
+                config_json TEXT NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE plates (
+                id INTEGER PRIMARY KEY, plate_code TEXT NOT NULL,
+                grid_rows INTEGER NOT NULL, grid_cols INTEGER NOT NULL,
+                cell_area_m2 REAL NOT NULL, created_at TEXT NOT NULL
+            );
+            CREATE TABLE exposures (
+                id INTEGER PRIMARY KEY,
+                segment_version_id INTEGER NOT NULL,
+                plate_id INTEGER NOT NULL,
+                mount_position TEXT,
+                installed_at TEXT NOT NULL,
+                removed_at TEXT NOT NULL,
+                photo_at TEXT NOT NULL,
+                unexposed_json TEXT NOT NULL DEFAULT '[]',
+                upload_hash TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                CHECK(removed_at >= installed_at),
+                UNIQUE(plate_id, installed_at, removed_at)
+            );
+            """
+        )
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        db.initialize(self.conn)
+
+        indexes = self.conn.execute("PRAGMA index_list('exposures')").fetchall()
+        auto_columns = []
+        for index in indexes:
+            if index["name"].startswith("sqlite_autoindex_exposures_"):
+                auto_columns.append([
+                    row["name"]
+                    for row in self.conn.execute(
+                        f"PRAGMA index_info('{index['name']}')"
+                    ).fetchall()
+                ])
+        self.assertIn(
+            ["segment_version_id", "plate_id", "installed_at", "removed_at"],
+            auto_columns,
+        )
+        self.assertNotIn(["plate_id", "installed_at", "removed_at"], auto_columns)
 
 
 class HttpSmokeTest(unittest.TestCase):
